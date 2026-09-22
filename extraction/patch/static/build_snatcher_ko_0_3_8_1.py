@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Snatcher Korean patch — 0.3.8.1.  상수 슬롯 재작성을 0.3.4 로 되돌린 판.
+
+0.3.8 은 0.3.4 로 되돌렸다고 했지만 되돌린 것은 환경변수 셋뿐이었고, 0.3.5 가
+실제로 바꾼 헬퍼 코드는 공유 stage 3 모듈에 그대로 남아 있었다.  그래서 0.3.8
+디스크도 `실례지만… 누구신가요?` 의 줄임표 칸이 깨졌다 (2026-08-16 확인).
+
+    0.3.4     helper 713 B   상수 96 B 를 매 레코드 무조건 복사
+    0.3.5-7   helper 765 B   센티널 2 바이트만 보고 건너뜀
+    0.3.8     helper 755 B   ^ 그대로 물려받음.  깨짐 재현됨
+    0.3.8.1   helper 741 B   SNATCHER_CONST_CHECK=0 -- 무조건 복사로 복귀
+
+센티널은 슬롯 0 의 첫 바이트와 슬롯 2 의 마지막 바이트만 본다.  그 사이가
+깨지면 검사를 통과하고 영영 복구되지 않는데, 슬롯 2 가 줄임표다.
+
+**0.3.8 폴더는 건드리지 않는다.**  그 디스크가 깨짐을 재현한 대조군이다.
+0.3.6 docstring 이 "0.3.5 를 제자리에서 덮어써 릴리스 노트와 디스크가 어긋났다"
+고 남긴 경고가 있다.  변형마다 번호를 새로 딴다.
+
+--- 0.3.8 원문 ---
+
+0.3.5-0.3.7 에서 글자 깨짐이 나와 마지막으로 정상이던 0.3.4 로 되돌렸다.
+여기에 저장 -> 타이틀 -> 로드 수정(handoff §0.6-§0.9)을 올린다.
+
+--- 0.3.4 원문 ---
+
+Snatcher Korean patch — 0.3.4.  THE official entry point.
+
+Run this, not the individual stage scripts.  It pins every parameter that the
+three stages used to take by hand, so a build is reproducible from the master
+TSVs alone:
+
+    python build_snatcher_ko_0_3_8_1.py              full build (stages 1-3)
+    python build_snatcher_ko_0_3_8_1.py --stage3     stage 3 only, reusing stage 1/2
+    python build_snatcher_ko_0_3_8_1.py --check      validate inputs, build nothing
+
+0.3.4 — the abandoned-factory flicker
+-------------------------------------
+0.3.3 flickered whenever Korean text started drawing in the abandoned factory:
+the bottom edge of the scene picture slipped down for a single frame and came
+straight back.  Three separate causes, each measured and fixed independently.
+See docs\\handoff\\SNATCHER_UI_FLICKER_HANDOFF_2026-08-14.md for the evidence.
+
+    1. The 608-byte template moved in ONE `TAI`.  Block transfers are atomic on
+       the HuC6280, so that instruction held interrupts off for 3,665 cycles --
+       8.05 scanlines -- on every string.  Now 76 B x 8: 1.04 scanlines.
+       `SNATCHER_TAI_CHUNK=608` restores the old single transfer.
+
+    2. Packs loaded from CD on first touch, and a stray probe could pull in a
+       pack nobody needed.  The game streams CD by itself in that scene on a
+       13-14 frame cadence, and every one of our loads pushed its next read out
+       to 22-30 frames; an untranslated line could stall for ~4 seconds.  All 25
+       packs now load during init.  `SNATCHER_PRELOAD_PACKS=0` goes back to
+       demand loading.
+
+    3. That same 608-byte copy ran on every record purely to restore constants
+       and blank glyph slots.  It now moves 96 + (previous record's glyph
+       count) * 32 bytes, which does both jobs exactly.
+
+           record cost   5,631 -> 3,829 cycles
+           IRQ block     8.05  -> 1.04 scanlines
+           CD in play    per-pack load + 2 seeks -> none
+
+What is NOT fixed
+-----------------
+Flicker still appears sporadically, and much more often after a voice line
+plays (roughly 3-in-10 before, 9-in-10 after, and it does not recover).  The
+game appears to lose frame budget to ADPCM servicing once voice has played;
+this patch cannot change that, only cost less.  It is a budget problem, not a
+defect -- nothing corrupts, nothing blocks progress.
+
+Rolling back
+------------
+Every stage is shared with 0.3.3, so a rollback is a one-line choice, not a
+revert:
+
+    python build_snatcher_ko_0_3_3.py              0.3.3 exactly as it shipped
+    SNATCHER_PRELOAD_PACKS=0 python build_snatcher_ko_0_3_8_1.py
+                                                  0.3.4 without the preload
+    SNATCHER_TAI_CHUNK=608 ...                    0.3.4 without the TAI split
+
+`build\\patch\\0.3.3\\` is PROTECTED and still has its payload, so the old disc
+can also just be played.
+
+Do NOT reach for the faster variants built on 2026-08-14 (`noblank`, `both`,
+`lean`, `lean2`).  They drop the glyph blanking, which costs a record whose text
+references a trailing blank slot: the previous line's syllable stays on screen.
+It is rare enough to pass a short test and still reach players.
+
+Version history behind this number
+----------------------------------
+The engine is the verified ``0.3.0-uitest`` renderer.  ``ac_0.1.1`` through
+``ac_0.1.18`` were the Arcade Card backing-store development series on top of
+it; ``ac_0.1.14`` was the last one.  0.3.0 promoted that combination to the
+project's single version number; 0.3.1 fixed the AC layout, 0.3.2 gave each
+scene pack its own address, 0.3.3 froze the pipeline, and 0.3.4 is the flicker
+work above.
+
+What is frozen
+--------------
+    engine            0.3.0-uitest renderer.  $66E5 hook, $5E40 preloader,
+                      $7F50 font wrapper, $5B80-$5E3F 704 B cache.  Do not
+                      redesign these.
+    record format     128 B compact record + global glyph atlas, expanded back
+                      to a byte-identical 704 B payload by the Bank 69 helper
+    CHUNK_BYTES       8 KiB.  Hard ceiling — above it the BIOS loses the AC
+                      auto-increment pointer at a bank boundary
+    stage 1 base      ac_0.1.11-source (intermediate, not a release)
+    inclusion         BODY: first unnamed review column is O (예외처리 = context
+                      -only continuation).  UI: review column is O.
+                      ko_text or status alone never ships a row.
+
+Inputs — the only canonical ones
+--------------------------------
+    snatcher_tool/translation/snatcher_ko_master.tsv
+    snatcher_tool/translation/ui_text.tsv
+    snatcher_tool/translation/speaker_name_standard.tsv
+
+Edit them through SnatcherTranslationStudio.exe.  Close Studio before touching
+them from outside, or Studio will write back its stale review column on save.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+STATIC = Path(__file__).resolve().parent
+ROOT = STATIC.parents[2]
+sys.path.insert(0, str(STATIC))
+
+VERSION = "0.3.8.1"
+STAGE1_VERSION = "ac_0.1.11-source"
+STAGE1_BUILD = ROOT / "build" / "patch" / STAGE1_VERSION
+OUT = ROOT / "build" / "patch" / VERSION
+
+TRANSLATION = ROOT / "snatcher_tool" / "translation"
+CANONICAL_INPUTS = (
+    TRANSLATION / "snatcher_ko_master.tsv",
+    TRANSLATION / "ui_text.tsv",
+    TRANSLATION / "speaker_name_standard.tsv",
+    # Stage 3 copies this into the build folder as a provenance record, so a
+    # missing file fails the build at the very last step.
+    TRANSLATION / "master_conflict_exclusions.tsv",
+)
+
+# 0.3.4's defaults, set here rather than left to whoever remembers the export.
+# A build has to be reproducible from this file alone.
+DEFAULTS = {
+    "SNATCHER_PRELOAD_PACKS": "1",   # no CD access during play
+    "SNATCHER_TAI_CHUNK": "76",      # 1.04 scanlines of IRQ block, not 8.05
+    "SNATCHER_BLANK_SLOTS": "1",     # bounded blanking; 0 leaves stale glyphs
+    # The flags above were never what 0.3.5 changed.  It rewrote the helper, and
+    # the rewrite is in the shared stage-3 module, so 0.3.8 inherited it: helper
+    # 755 B against 0.3.4's 713 B.  This is the piece that had to come back --
+    # see SNATCHER_CONST_CHECK in build_ac_dynamic_0_1_14.py for the evidence.
+    "SNATCHER_CONST_CHECK": "0",     # re-lay the constants every record, as 0.3.4 did
+}
+
+# Names refused even when named explicitly.  0.3.3 stays playable as the
+# rollback target, 0.2.26 is the BODY control build, and the other two are what
+# the current build stands on.
+PROTECTED = {VERSION, "0.3.8", "0.3.7", "0.3.6", "0.3.5", "0.3.4", "0.3.3", STAGE1_VERSION, "ac_0.1.14", "0.2.26"}
+PAYLOAD_SUFFIXES = (".bin", ".chd")
+
+
+def prune(names: list[str], deep: bool = False) -> None:
+    """Delete disc payloads from the named builds, keeping their records.
+
+    Standing rule from the project owner: **no build is ever pruned unless he
+    has called that build an experiment.**  The caller has to name what goes,
+    so nothing goes by default.
+    """
+    targets = set(names) | ({STAGE1_VERSION} if deep else set())
+    if not targets:
+        raise SystemExit(
+            "--prune needs the build folders to drop, e.g.\n"
+            f"    --prune {VERSION}-base {VERSION}-experiment\n"
+            "No build is pruned unless it is named an experiment.")
+    guarded = targets & PROTECTED
+    if guarded:
+        raise SystemExit(f"refusing to prune protected build(s): "
+                         f"{', '.join(sorted(guarded))}")
+    root = ROOT / "build" / "patch"
+    freed = unlinked = 0
+    for build in sorted(p for p in root.iterdir() if p.is_dir()):
+        if build.name not in targets:
+            continue
+        for path in sorted(build.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in PAYLOAD_SUFFIXES:
+                continue
+            stat = path.stat()
+            # A hardlinked track shares its inode with rom(japan), so removing
+            # this name frees nothing.  Drop it anyway to keep the folder
+            # honest, but do not claim the bytes back.
+            if stat.st_nlink > 1:
+                unlinked += 1
+            else:
+                freed += stat.st_size
+            path.unlink()
+    if freed or unlinked:
+        print(f"pruned {freed / 1e6:,.0f} MB "
+              f"({unlinked} hardlinked track names also dropped) from "
+              f"{', '.join(sorted(targets))}")
+
+
+def check_inputs() -> None:
+    missing = [p for p in CANONICAL_INPUTS if not p.exists()]
+    if missing:
+        raise SystemExit(
+            "missing canonical input(s):\n  "
+            + "\n  ".join(str(p) for p in missing)
+        )
+
+    sys.path.insert(0, str(ROOT / "extraction" / "translation"))
+    import build_full_overlay_layout as layout
+    from tsv_io import read_dict_rows
+
+    selected, exceptions = layout.reviewed_row_ids(TRANSLATION / "snatcher_ko_master.tsv")
+    ui_header, ui_rows = read_dict_rows(TRANSLATION / "ui_text.tsv")
+    review = layout.ui_review_column(ui_header)
+    ui_ok = [r for r in ui_rows
+             if r.get("ko_text", "").strip()
+             and r.get("status", "") != "skip"
+             and layout.is_ui_reviewed(r, review)]
+    ui_translated = [r for r in ui_rows if r.get("ko_text", "").strip()]
+
+    print(f"BODY  reviewed rows : {len(selected):,} (예외처리 {len(exceptions)})")
+    print(f"UI    review column : {review!r}")
+    print(f"UI    translated    : {len(ui_translated):,} / {len(ui_rows):,}")
+    print(f"UI    review = O    : {len(ui_ok):,}   <- this is what ships")
+    if ui_translated and not ui_ok:
+        print()
+        print("  NOTE: every UI row is unreviewed, so this build ships 0 UI labels.")
+
+
+def stage(argv: list[str], title: str) -> None:
+    print(f"\n=== {title} ===", flush=True)
+    # Pin the translator workspace rather than trusting the ambient default.
+    env = dict(os.environ, SNATCHER_TRANSLATION_DIR=str(TRANSLATION))
+    result = subprocess.run([sys.executable, *argv], cwd=str(ROOT), env=env)
+    if result.returncode != 0:
+        raise SystemExit(f"{title} failed (exit {result.returncode})")
+
+
+def main() -> None:
+    global VERSION, OUT, STAGE1_VERSION, STAGE1_BUILD
+
+    parser = argparse.ArgumentParser(description=f"build Snatcher KO {VERSION}")
+    parser.add_argument("--stage3", action="store_true",
+                        help="rebuild only stage 3, reusing the existing "
+                             f"{STAGE1_VERSION} intermediate")
+    parser.add_argument("--check", action="store_true",
+                        help="report what would ship, then stop")
+    parser.add_argument("--prune", nargs="*", metavar="BUILD",
+                        help="delete the named builds' disc payload, then stop. "
+                             "Name only builds the owner has called experiments "
+                             "-- nothing is pruned by default")
+    parser.add_argument("--deep", action="store_true",
+                        help=f"with --prune, also drop the {STAGE1_VERSION} "
+                             "intermediate (costs the next build its --stage3)")
+    parser.add_argument("--space", choices=("8140", "F041", "20"), default="8140",
+                        help="byte sequence a Korean word space compiles to. "
+                             "8140 = native full cell (default, what ships). "
+                             "F041 = reserved fractional space, two per cursor "
+                             "unit. 20 = the renderer's single-byte space "
+                             "branch. Non-default values build into a suffixed "
+                             "folder and are experiments, not releases.")
+    parser.add_argument("--tag", default="",
+                        help="suffix the build and its stage 1/2 intermediate "
+                             "with this name. Use it when the experiment is in "
+                             "the translation data rather than in a flag, so "
+                             "the release folder is never overwritten.")
+    args = parser.parse_args()
+
+    # Apply 0.3.4's defaults without clobbering a deliberate override, so
+    # `SNATCHER_PRELOAD_PACKS=0 python build_snatcher_ko_0_3_8_1.py` still works
+    # as the documented rollback.
+    for name, value in DEFAULTS.items():
+        os.environ.setdefault(name, value)
+    changed = {n: os.environ[n] for n, v in DEFAULTS.items() if os.environ[n] != v}
+    if changed:
+        print("non-default runtime options: "
+              + ", ".join(f"{n}={v}" for n, v in sorted(changed.items())))
+
+    suffix = ""
+    if args.space != "8140":
+        os.environ["SNATCHER_KO_SPACE"] = args.space
+        suffix += f"-space{args.space}"
+        print(f"space experiment: Korean word spaces compile to {args.space}")
+    if args.tag:
+        suffix += f"-{args.tag}"
+
+    if suffix:
+        # Keep the release build untouched: an experiment gets its own folder
+        # and its own name so a stray disc can never be mistaken for a release.
+        VERSION = f"{VERSION}{suffix}"
+        STAGE1_VERSION = f"{STAGE1_VERSION}{suffix}"
+        OUT = ROOT / "build" / "patch" / VERSION
+        STAGE1_BUILD = ROOT / "build" / "patch" / STAGE1_VERSION
+        PROTECTED.update({VERSION, STAGE1_VERSION})
+        print(f"  stage 1/2 -> {STAGE1_BUILD}")
+        print(f"  output    -> {OUT}")
+
+    if args.prune is not None:
+        prune(args.prune, deep=args.deep)
+        return
+
+    check_inputs()
+    if args.check:
+        return
+
+    if args.stage3:
+        if not STAGE1_BUILD.exists():
+            raise SystemExit(
+                f"--stage3 needs {STAGE1_BUILD}, which is missing. "
+                "Run without --stage3 to regenerate it.")
+        print(f"\nreusing stage 1/2 intermediate: {STAGE1_BUILD}")
+    else:
+        stage([str(STATIC / "build_direct_overlay_patch_ui.py"),
+               "--version", STAGE1_VERSION, "--review-only", "--force"],
+              "stage 1  master -> 704 B SRT4 records")
+        stage([str(STATIC / "build_ac_backing_store.py"),
+               "--build", str(STAGE1_BUILD)],
+              "stage 2  sparse slots -> dense record image")
+
+    print("\n=== stage 3  compact 128 B + atlas + AC packs + disc ===", flush=True)
+    import build_ac_dynamic_0_1_14 as stage3
+
+    # Same wrapper pattern the AC series used: retarget the shared dynamic
+    # module, then run the pinned stage 3.
+    dynamic = stage3.dynamic
+    dynamic.VERSION = VERSION
+    dynamic.OUT = OUT
+    dynamic.BASE = STAGE1_BUILD
+    stage3.main()
+
+    print(f"\n{VERSION} -> {OUT}")
+
+
+if __name__ == "__main__":
+    main()

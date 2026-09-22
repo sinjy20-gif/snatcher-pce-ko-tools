@@ -1,0 +1,61 @@
+-- SUB 0.4.38 -- Lua 프레임 전환 + 19글자 독립 list + 동적 allocator
+--
+-- next_selector/elapsed를 sprite list 17~18번째 글자 위에 겹쳐 쓰던 구조를
+-- 제거했다. 조각 시간은 Lua가 세고, 전환 순간에만 selector를 써서 rebuild한다.
+
+SUB_VOICE_KEY_VERSION = '0.4.38'
+SUB_VOICE_ENGINE_PATH = 'C:/snatcher/build/cutscene_subs/engine_ac_lua_frame_mini.bin'
+SUB_VOICE_ENGINE_BYTES = 631
+SUB_VOICE_SELECTOR = 345
+SUB_VOICE_MINI_INDEX = 0x1EF000
+SUB_VOICE_MINI_COUNT = 5
+SUB_VOICE_LUA_TIMER = true
+SUB_VOICE_READY_OFFSET = 343
+SUB_VOICE_NO_NEXT_SELECTOR = true
+dofile('C:/snatcher/lua/SUB/0.4.31.lua')
+SUB_VOICE_KEY_VERSION = nil
+SUB_VOICE_ENGINE_PATH = nil
+SUB_VOICE_ENGINE_BYTES = nil
+SUB_VOICE_SELECTOR = nil
+SUB_VOICE_MINI_INDEX = nil
+SUB_VOICE_MINI_COUNT = nil
+SUB_VOICE_LUA_TIMER = nil
+SUB_VOICE_READY_OFFSET = nil
+SUB_VOICE_NO_NEXT_SELECTOR = nil
+
+local MEM = emu.memType.pceMemory
+local CPU = emu.cpuType.pce
+local ENGINE = 0x5B80
+local COUNT_OK = ENGINE + 118
+local RECORD_Y = ENGINE + 440 + 3
+
+emu.addMemoryCallback(function()
+  local before = emu.read(RECORD_Y, MEM) or 0
+  if before ~= 122 then emu.write(RECORD_Y, 122, MEM) end
+end, emu.callbackType.exec, COUNT_OK, COUNT_OK, CPU, MEM)
+
+SUB_ALLOCATOR_VERSION = '0.4.38-dynamic'
+SUB_ALLOCATOR_INPLACE_IMAGES = true
+SUB_ALLOCATOR_TARGET_END = false
+SUB_ALLOCATOR_PATCH_AT_COUNT_OK = true
+SUB_ALLOCATOR_ENGINE = ENGINE
+SUB_ALLOCATOR_REBUILD_OFFSET = 17
+SUB_ALLOCATOR_COUNT_OK_OFFSET = 118
+SUB_ALLOCATOR_VRAM_LO_OFFSET = 144
+SUB_ALLOCATOR_VRAM_HI_OFFSET = 146
+SUB_ALLOCATOR_PAT_LO_OFFSET = 255
+SUB_ALLOCATOR_ATTR_OFFSET = 260
+dofile('C:/snatcher/lua/SUB/0.3.42-wide.lua')
+SUB_ALLOCATOR_VERSION = nil
+SUB_ALLOCATOR_INPLACE_IMAGES = nil
+SUB_ALLOCATOR_TARGET_END = nil
+SUB_ALLOCATOR_PATCH_AT_COUNT_OK = nil
+SUB_ALLOCATOR_ENGINE = nil
+SUB_ALLOCATOR_REBUILD_OFFSET = nil
+SUB_ALLOCATOR_COUNT_OK_OFFSET = nil
+SUB_ALLOCATOR_VRAM_LO_OFFSET = nil
+SUB_ALLOCATOR_VRAM_HI_OFFSET = nil
+SUB_ALLOCATOR_PAT_LO_OFFSET = nil
+SUB_ALLOCATOR_ATTR_OFFSET = nil
+
+emu.log('SUB 0.4.38 armed -- first Gillian voice excluded · Lua fragments · independent 19-cell list')

@@ -1,0 +1,861 @@
+-- SUB 0.3.43-defer -- 0.3.42-wide + 자막이 사라질 때의 잔상 제거
+--
+-- 증상: 자막이 바뀌거나 사라지는 순간 한 프레임 정도 얼룩이 스친다.
+--
+-- 원인: SATB 는 rebuild 보다 **한 프레임 늦게** 새 블록을 가리킨다.  이 파일
+-- 자신의 "+01 frame" 검증 로그가 매번 그 증거를 찍어 왔다:
+--
+--     #3 selected at count_ok
+--     +01 frame   SATB -> $1A80 $1AC0 ... $1E00     <- 아직 옛 블록
+--     +02 frame   SATB -> $2BC0 $2C00 ... $3000     <- 그제서야 새 블록
+--
+-- 그런데 0.3.42-wide 는 count_ok 에서 새 블록을 고르기 **전에** 옛 블록을 먼저
+-- 복원했다.  그래서 그 한 프레임 동안 스프라이트는 옛 주소를 가리키는데 그 자리
+-- VRAM 은 이미 게임 원본으로 돌아가 있다 -- 게임 타일이 팔레트 15 로 그려진다.
+-- 그게 잔상의 정체다.
+--
+-- 고침: 조각 전환에서는 복원하지 않는다.  음성이 끝난 뒤, **SATB 가 그 블록을
+-- 더는 가리키지 않을 때** 되돌린다.  전환 순간 스프라이트가 옛 주소를 한 프레임
+-- 더 가리켜도 거기엔 이전 자막 글리프가 그대로 있으므로 눈에 띄지 않는다.
+--
+-- 안전장치 둘:
+--   * 블록을 다시 쓰기로 하면 그 블록의 복원 예약을 취소한다.  안 그러면 새로
+--     올린 글리프를 옛 스냅샷으로 덮어버린다.
+--   * SATB 가 끝내 안 놓아주면 PENDING_LIMIT 프레임 뒤 강제로 되돌린다.
+--     게임 VRAM 을 우리 글리프로 남겨 두는 것보다는 낫다.
+--
+-- 이하 0.3.42-wide 의 기록을 그대로 둔다.
+--
+-- SUB 0.3.42-wide -- 0.3.41 의 기법을 **동적 탐색**으로 쓴다
+--
+-- 0.3.41 은 base 를 $1140 으로 강제해 "창 밖 주소가 실제로 동작하는가"를 물었다.
+-- 답은 예였다 -- SATB 사슬이 $1140 $1180 $11C0 ... 로 완전히 일치했다.
+-- 그런데도 "실패"로 적혔다.  하단 깨짐이 그대로였기 때문이다.
+--
+-- **그 하단 깨짐은 우리 것이 아니었다** (2026-08-28 소유자 확인, 코어 정확도 문제).
+-- 즉 0.3.41 은 성공한 실험이었고, 잘못된 기준으로 폐기됐다.
+--
+-- 이 판은 FORCE_BASE 를 끄고 창을 VRAM 전체로 넓힌 것이다.  근거:
+--
+--     08-28 초상화 장면 실측
+--       INTRUDER 슬롯 16·18·19·20·21  패턴 $6000~$647F  팔레트 C
+--       우리 블록                      $6000~$64BF
+--     -> allocator 가 고른 뒤에 게임이 같은 자리를 가져갔다.  SKIP 은 0 이었다.
+--        창이 $6000-$7B00 뿐이라 게임과 같은 8K 를 다투는 구조였다.
+--
+-- 확인할 것: 침범 0 · SKIP 0 · 고른 자리가 $1xxx-$5xxx 대로 내려가는가
+--
+-- SUB 0.3.41 -- 0.3.40 + 32 word 정렬 ($1110 -> $1140)
+--
+-- 0.3.40 에서 off 281 패치가 먹어 SATB 가 $71xx -> $11xx 로 옮겨졌다.
+-- 다만 강제 base $1110 이 32 word 배수가 아니라 SATB 는 $1100 을 가리켰다.
+-- ($1110>>5 = 0x88,  0x88<<5 = $1100 -- 16 word 어긋남)
+-- 스프라이트 패턴 주소 단위가 32 word 이므로 base 는 반드시 그 배수여야 한다.
+--
+-- 이 판은 기본 $1140 이고, 어긋난 값이 들어와도 & 0xFFE0 으로 내림 정렬한다.
+-- 기대: SATB 가 $1140 $1180 $11C0 ... 을 가리키고 자막이 정상으로 뜬다.
+--
+-- SUB 0.3.40 -- 패턴 상위 비트까지 패치.  창 제약이 풀린다.
+--
+-- build_subtitle_engine.py 의 레코드 5번째 바이트 주석에서 찾았다:
+--   0x80 | ((word >> 8) << 4) | palette,  word = base >> 5
+--   $6463 이 AND #$70 으로 패턴 상위를, AND #$8F 로 속성을 뽑는다
+-- base $7900 -> word 0x3C8 -> word>>8 = 3 -> 0x80|0x30|0x0F = 0xBF (렌더러 off 281)
+--
+-- 즉 상위 비트는 0x03 이 아니라 0xBF 안에 <<4 되어 섞여 있었다.
+-- 이제 off 281 도 같이 고치므로 base 를 VRAM 어디로든 옮길 수 있다.
+--
+-- 이 판은 FORCE_BASE = $1110 (0.3.36 이 3,824 word 연속 공백을 확인한 자리).
+-- 성공하면 SATB 가 $1110 을 가리키고 자막이 정상으로 떠야 한다.
+-- 평소 탐색으로 쓰려면 FORCE_BASE 를 nil 로, 그리고 choose() 의 창을 넓히면 된다.
+--
+-- SUB 0.3.39 -- 0.3.38 의 측정 시점 오류를 고친 판
+--
+-- 0.3.38 은 count_ok 직후에 VRAM 을 읽었다.  그 시점은 헬퍼가 글리프를 복사하기
+-- 전이라 base 도 $7900 도 항상 0 이 나온다.  질문에 답을 못 하는 측정이었다.
+--
+-- 이 판은 패치 뒤 +1 / +2 / +4 / +8 / +16 / +30 프레임에 읽는다.  그리고
+-- SATB 가 실제로 가리키는 VRAM 주소를 같이 찍는다 -- 하드웨어가 무엇을 보고
+-- 그리는지가 결국 답이기 때문이다.
+--
+-- 읽는 법:
+--   base 가 차고 SATB 가 base 를 가리킴      -> 경로가 옮겨졌다.  깨짐은 다른 원인
+--   base 는 비었는데 SATB 는 base 를 가리킴  -> 참조만 옮겨지고 복사가 안 따라옴
+--                                              (헬퍼 목적지가 안 바뀐 것)
+--   SATB 가 엉뚱한 주소를 가리킴             -> 패턴 상위 비트가 실재한다
+--
+-- SUB 0.3.38 -- 0.3.37 + "패치가 정말 먹었나" 확인
+--
+-- 0.3.37 로 base 를 $1110 으로 강제했는데 하단 깨짐이 이전과 똑같다는 보고.
+-- 그렇다면 글리프 쓰기 경로가 안 옮겨진 것이다.  의심 지점:
+--
+--   prepareFirst 는 헬퍼를 AC 사본에 패치한다 (AC_HELPER + 39/41/131/133).
+--   그런데 헬퍼는 AC 에서 실행되지 않는다 -- RAM 으로 복사된 뒤 돈다.
+--   이미 복사가 끝난 뒤라면 AC 를 고쳐도 이번 판에는 효과가 없다.
+--   그러면 글리프는 여전히 $7900 에 쓰이고 SATB 만 $1110 을 가리킨다.
+--
+-- 이 판은 count_ok 패치 직후 세 가지를 읽어서 찍는다.
+--
+--   CPU 렌더러 off 165/167/276 이 기대값인가        -> 렌더러 패치 성공 여부
+--   AC 헬퍼   off 39/41/131/133 이 기대값인가        -> AC 쓰기 자체는 됐는가
+--   VRAM 의 base / $7900 / $6100 에 0 아닌 word 수  -> 글리프가 실제로 어디 있나
+--
+-- 마지막 줄이 핵심이다.  base 가 0 이고 $7900 이 차 있으면 쓰기 경로가
+-- 안 옮겨진 것이고, 헬퍼를 RAM 사본에서 패치해야 한다는 뜻이다.
+--
+-- SUB 0.3.37 -- 창 밖 주소 강제 시험 (패턴 상위 비트가 실재하는지 가른다)
+--
+-- 0.3.36 측정:
+--   창 $6000-$7FFF  최대연속   768 word · 총여유  1,392
+--   VRAM 전체       최대연속 3,824 word @ $1110 · 총여유 11,648
+--   (BAT 4096 + SATB 256 은 used 로 제외)
+--
+-- 자리는 창 밖에 있다.  그런데 $1110 을 쓰려면 base>>13 이 3 에서 0 으로
+-- 바뀌므로 패턴 상위 2 비트를 패치해야 하는데, 그 자리를 바이너리에서 아직
+-- 못 찾았다 (LDA #$03 없음 · STA $5CF3,X 없음 · off 364 이후는 작업 버퍼).
+--
+-- 그래서 아는 것만 고치고 강제로 써 본다.
+--
+--   patch  off 165 MAWR 하위 · off 167 MAWR 상위 · off 276 패턴 하위
+--   미패치 패턴 상위 2 비트
+--
+-- 결과 해석:
+--   글리프 정상          상위 비트는 안 쓰이거나 다른 데서 유도된다 -> 창 확장 끝
+--   글리프 엉뚱한 자리   상위 비트 실재 -> 렌더러 쪽을 계속 추적
+--   아무것도 안 뜸       헬퍼가 복사를 못 한다 -> 헬퍼 쪽도 상위 비트 필요
+--
+-- 주소를 바꿔 보려면:  SUB_ALLOCATOR_FORCE_BASE = 0xXXXX  를 먼저 세우고 실행.
+-- 평소 탐색으로 돌리려면 파일 안 FORCE_BASE 를 nil 로.
+-- snapshot/restore 는 그대로라 음성이 끝나면 원래 내용으로 되돌린다.
+--
+-- SUB 0.3.36 -- 0.3.35 의 측정 오류를 고친 판
+--
+-- 0.3.35 는 "VRAM 전체 최대연속 4352 word @ $0000" 을 찍고 "창 확장으로 해결
+-- 가능" 이라고 판정했다.  ★ 그 4352 word 는 BAT($0000-$0FFF, 4096) 와
+-- SATB($1000-$10FF, 256) 자신이다.  referencedWords() 가 BAT 가 가리키는
+-- 타일 패턴만 표시하고 BAT/SATB 본체는 표시하지 않아서 살아 있는 구조 둘이
+-- 통째로 "비어 있음" 으로 잡혔다.
+--
+-- 지금 창이 $6000-$7B00 이라 우연히 안 건드렸을 뿐이다.  그 판정을 믿고 창을
+-- 넓혔으면 BAT 를 덮어써 화면이 통째로 날아갔다.
+--
+-- 이 판은 BAT 와 SATB 를 used 로 표시한 뒤 다시 잰다.  나머지는 0.3.35 와 같다.
+--
+-- SUB 0.3.35 -- 0.3.34 + 실패 시 부족량 측정
+--
+-- 0.3.34 (간격 0x40, 시도 108 번) 로도 조각 #2 에서 SKIP 이 났다.
+-- 다음 수를 고르려면 "얼마나 모자란가" 를 알아야 한다.
+--
+--   창 $6000-$7FFF 최대연속 < N  그런데  VRAM 전체 최대연속 >= N
+--       -> 창 확장으로 해결된다 (패턴 상위 2 비트 자리를 찾아야 함)
+--   VRAM 전체 최대연속 < N
+--       -> 창을 넓혀도 소용없다.  글리프 개별 배치로 연속성을 깨거나
+--          N (= 글리프 수 x 0x40) 을 줄여야 한다
+--
+-- SKIP 이 날 때만 SHORTFALL 세 줄을 찍는다.  나머지 동작은 0.3.34 와 같다.
+--
+-- SUB 0.3.34 -- 0.3.5 와 같은 동작 + 후보 간격 0x100 -> 0x40 (독립 파일)
+--
+-- 왜: 0.3.5 로 메탈기어 이후 문서 화면을 지나니 조각 #2 에서
+--     "SKIP: count_ok 뒤 안전 블록 없음" 이 났다.  그 장면은 BG 패턴 892 개
+--     (약 14,272 word)가 참조 중이라 $6000-$7B00 을 0x100 간격으로 28 번
+--     보는 것으로는 연속 1216 word 를 못 찾는다.  간격을 0x40 으로 줄여
+--     시도를 28 -> 108 번으로 늘린다.
+--
+-- 어떻게: 지금까지는 VRAM 주소의 상위 바이트만 패치해 base 가 0x100 정렬이어야
+--     했다.  바이너리를 뜯어 하위 바이트 자리를 찾았다.
+--
+--       renderer  off 164 13 00 = ST1 #$00  -> off 165 가 MAWR 하위
+--                 off 166 23 79 = ST2 #$79  -> off 167 이 MAWR 상위
+--                 off 276 = 패턴 하위 (69 C8 = ADC #$C8)
+--       helper    off 38 13 00 -> off 39 하위 / off 40 23 79 -> off 41 상위
+--                 off 130 13 00 -> off 131 하위 / off 132 23 79 -> off 133 상위
+--
+--     이제 하위 바이트도 같이 패치하므로 검사한 자리와 실제 업로드 자리가 같다.
+--
+-- 창은 아직 $6000-$7B00 그대로다.  32K 전체로 넓히려면 패턴 상위 2 비트
+-- (base>>13) 자리를 찾아야 하는데 아직 확정하지 않았다.  이 창 안에서는
+-- base>>5 의 상위 2 비트가 항상 3 이라 상위 비트를 안 건드려도 정합하다.
+--
+-- 0.3.5 의 전역 설정(INPLACE_IMAGES / TARGET_END=0x6800 / PATCH_AT_COUNT_OK)을
+-- 파일 안에 기본값으로 넣었다.  이 파일 하나만 실행하면 된다.
+-- 읽기 전용이 아니다 -- VRAM 주소 피연산자와 VRAM 자체를 쓴다.
+--
+-- Dynamic subtitle VRAM allocator POC 0.3.1 -- referenced-free blocks (2026-08-26)
+--
+-- 0.3.0 은 VRAM 내용이 전부 0 인 블록만 골랐다.  게임은 장면이 바뀌어도 예전
+-- 패턴을 VRAM 에 남겨 두므로, 아무도 참조하지 않는 안전한 자리도 거의 전부
+-- 탈락했다.  이 판은 내용이 아니라 현재 BAT + SATB 참조만 본다.
+--
+-- 이번 판의 범위
+-- -------------
+--   * BAT: 현재 VDC columnCount * rowCount 엔트리가 참조하는 8x8 패턴 제외
+--   * SATB: 현재 64 슬롯이 참조하는 스프라이트 패턴 범위 제외
+--   * 후보 간격은 0x100 word 유지
+--
+-- 후보 간격을 아직 0x40 으로 줄이지 않는 이유:
+-- helper/renderer 의 VRAM 주소 하위 바이트는 현재 바이너리에 00 으로 고정돼 있고
+-- 이 Lua 는 상위 바이트만 패치한다.  하위 바이트 패치 위치를 확정하기 전 0x40
+-- 후보를 쓰면 검사한 자리와 실제 백업/업로드 자리가 달라질 수 있다.
+--
+-- Lua 전용 검증판.  디스크 빌드에는 아직 넣지 않는다.
+
+local MEM, VRAM, AC, CPU = emu.memType.pceMemory, emu.memType.pceVideoRam,
+                              emu.memType.pceArcadeCardRam, emu.memType.cpu
+local VERSION = rawget(_G, 'SUB_ALLOCATOR_VERSION') or '0.3.41'
+local INPLACE_IMAGES = rawget(_G, 'SUB_ALLOCATOR_INPLACE_IMAGES') ~= false
+-- nil/미지정은 기존 단일 POC 키 $6800, false는 명시적인 모든 ADPCM 모드다.
+-- 예전에는 `or 0x6800` 때문에 wrapper가 false를 줘도 단일 키로 되돌아갔다.
+local TARGET_END_SETTING = rawget(_G, 'SUB_ALLOCATOR_TARGET_END')
+local TARGET_END = TARGET_END_SETTING == nil and 0x6800 or TARGET_END_SETTING
+-- 창 밖 주소를 강제로 써 본다.  0.3.36 측정에서 $1110-$1FFF 에
+-- 3824 word 연속 공백이 있었다.  nil 로 두면 평소대로 탐색한다.
+local FORCE_BASE = rawget(_G, 'SUB_ALLOCATOR_FORCE_BASE')
+-- 스프라이트 패턴 주소는 32 word 단위다.  base 가 그 배수가 아니면
+-- 쓴 곳과 읽는 곳이 어긋난다 (0.3.40 에서 $1110 -> SATB $1100 으로 관측).
+if FORCE_BASE then FORCE_BASE = FORCE_BASE & 0xFFE0 end
+local PATCH_AT_COUNT_OK = rawget(_G, 'SUB_ALLOCATOR_PATCH_AT_COUNT_OK') ~= false
+local REQUIRE_MATCHED = rawget(_G, 'SUB_ALLOCATOR_REQUIRE_MATCHED') == true
+local VERIFY_DETAIL = rawget(_G, 'SUB_ALLOCATOR_VERIFY_DETAIL') ~= false
+local ENGINE = rawget(_G, 'SUB_ALLOCATOR_ENGINE') or 0x5B80
+local REBUILD = ENGINE + (rawget(_G, 'SUB_ALLOCATOR_REBUILD_OFFSET') or 38)
+local COUNT_OK_OFFSET = rawget(_G, 'SUB_ALLOCATOR_COUNT_OK_OFFSET') or 139
+local VRAM_LO_OFFSET = rawget(_G, 'SUB_ALLOCATOR_VRAM_LO_OFFSET') or 165
+local VRAM_HI_OFFSET = rawget(_G, 'SUB_ALLOCATOR_VRAM_HI_OFFSET') or 167
+local PAT_LO_OFFSET = rawget(_G, 'SUB_ALLOCATOR_PAT_LO_OFFSET') or 276
+local ATTR_OFFSET = rawget(_G, 'SUB_ALLOCATOR_ATTR_OFFSET') or 281
+-- 2026-08-29 성능 손잡이.  기본값은 옛 동작과 같다 (매 프레임).
+--
+-- drain 과 침범 감시는 자막이 떠 있는 동안 매 프레임 SATB 를 훑는다.
+-- drain    64슬롯 × 2표 × 4 read = 512 read/frame
+-- 침범감시 64슬롯 × 4 read       = 256 read/frame
+-- 합쳐서 프레임당 768 emu.read 다.  이것이 60 -> 21 FPS 의 주범이다.
+--
+-- N 을 키우면 N 프레임마다 한 번만 훑는다.  GRACE/PENDING_LIMIT 은 drain
+-- 호출 횟수로 세므로 실제 대기 시간이 N 배로 늘어난다 (더 보수적이 된다).
+local DRAIN_EVERY = math.max(1, math.floor(tonumber(rawget(_G, 'SUB_ALLOCATOR_DRAIN_EVERY')) or 1))
+local WATCH_EVERY = math.max(1, math.floor(tonumber(rawget(_G, 'SUB_ALLOCATOR_WATCH_EVERY')) or 1))
+local drainTick, watchTick = 0, 0
+local STATE = 0x7FDF
+local AC_HELPER, AC_RENDERER = 0x1F1C00, 0x1F1F00
+local N = 19 * 0x40
+local active, started, firstBase, currentBase, pendingBase, rebuilds = false, false, nil, nil, nil, 0
+local saved = {}
+
+local function readFile(path)
+  local f = assert(io.open(path, 'rb'), 'cannot open ' .. path)
+  local d = f:read('*a'); f:close(); return d
+end
+local HELPER = readFile('C:/snatcher/build/cutscene_subs/subtitle_vram_helper.bin')
+local RENDERER = readFile('C:/snatcher/build/cutscene_subs/engine_ac_timed_safe_poc.bin')
+local KEY = {0x78, 0x30, 0x00, 0x00, 0x68, 0x0E}
+
+local function poke(s, pos, value)
+  return s:sub(1, pos - 1) .. string.char(value) .. s:sub(pos + 1)
+end
+local function put(at, data)
+  for i = 1, #data do emu.write(at + i - 1, data:byte(i), AC) end
+end
+local function prepareFirst(base)
+  -- helper 41/133, renderer 167/276 are binary zero-based offsets.
+  if INPLACE_IMAGES then
+    -- 0.3.2: 디스크가 Track24에서 선적재한 현재 판본을 보존한다.
+    -- 전체 이미지를 로컬 파일로 교체하거나 selector KEY를 덮지 않고,
+    -- VRAM 기준 주소를 담은 피연산자 네 바이트만 바꾼다.
+    emu.write(AC_HELPER + 39, base & 0xFF, AC)
+    emu.write(AC_HELPER + 41, base >> 8, AC)
+    emu.write(AC_HELPER + 131, base & 0xFF, AC)
+    emu.write(AC_HELPER + 133, base >> 8, AC)
+    if PATCH_AT_COUNT_OK then
+      -- 조회가 끝나기 전에는 renderer를 한 바이트도 건드리지 않는다.
+      -- CPU로 복사된 뒤 count_ok callback에서 주소만 바꾼다.
+      return
+    end
+    emu.write(AC_RENDERER + 281, 0x80 | (((base >> 13) & 0x07) << 4) | 0x0F, AC)
+    emu.write(AC_RENDERER + 165, base & 0xFF, AC)
+    emu.write(AC_RENDERER + 167, base >> 8, AC)
+    emu.write(AC_RENDERER + 276, (base >> 5) & 0xFF, AC)
+    return
+  end
+  local h = poke(poke(HELPER, 42, base >> 8), 134, base >> 8)
+  local r = poke(poke(RENDERER, 168, base >> 8), 277, (base >> 5) & 0xFF)
+  put(AC_HELPER, h); put(AC_RENDERER, r)
+  for i = 1, 6 do emu.write(AC_RENDERER + 365 + i, KEY[i], AC) end
+end
+
+local function rb(addr) return emu.read(addr, VRAM) or 0 end
+local function wb(addr, value) emu.write(addr, value, VRAM) end
+local function rw(word)
+  local at = word * 2
+  return rb(at) | (rb(at + 1) << 8)
+end
+
+local function snapshot(base)
+  local data = {}
+  for word = base, base + N - 1 do
+    local at = word * 2
+    data[#data + 1] = rb(at)
+    data[#data + 1] = rb(at + 1)
+  end
+  saved[base] = data
+end
+
+local function restore(base)
+  local data = saved[base]
+  if not data then return false end
+  for word = base, base + N - 1 do
+    local at, i = word * 2, (word - base) * 2 + 1
+    wb(at, data[i]); wb(at + 1, data[i + 1])
+  end
+  return true
+end
+
+-- ── 0.3.43: 복원을 미루는 대기열 ────────────────────────────────────────────
+local pending = {}
+local PENDING_LIMIT = 180          -- 끝내 안 놓아주면 3초 뒤 강제 복원
+local GRACE = 4                    -- 두 표가 연속 이만큼 비어야 되돌린다
+
+-- ★ 게임이 가져간 자리는 되돌리지 않는다
+--
+-- 이 파일의 머리말에 적힌 깁슨 환경 A 컴퓨터 계열 실패가 여기서 다시 문다:
+--   "allocator 가 고른 뒤에 게임이 같은 자리를 가져갔다"
+-- 고를 때는 미참조였어도, 우리가 글리프를 올린 **뒤에** 게임이 그 VRAM 을 자기
+-- 용도로 쓰기 시작할 수 있다.  그 상태에서 옛 스냅샷을 되돌리면 게임이 방금
+-- 그린 것을 우리가 지운다.  복원을 미룰수록 이 창이 길어진다.
+--
+-- 그래서 되돌리기 직전에 "이 블록이 아직 우리가 쓴 그대로인가" 를 본다.
+-- 다르면 게임이 가져간 것이므로 손대지 않고 대기열에서만 뺀다.
+local mine, needPrint = {}, {}
+local FP_STEP = math.floor(N / 64)
+
+local function fingerprint(base)
+  local t = {}
+  for i = 0, 63 do
+    local at = (base + i * FP_STEP) * 2
+    t[i + 1] = string.char(rb(at), rb(at + 1))
+  end
+  return table.concat(t)
+end
+
+-- 스프라이트가 우리 블록을 아직 가리키는가.
+--
+-- ★ 두 군데를 다 봐야 한다.  PC엔진의 스프라이트 표는 둘이다:
+--     VRAM 의 SATB ($2000)   -- CPU 가 아무 때나 쓴다
+--     VDC 내부 Sprite RAM    -- 프레임당 한 번 DMA 로만 갱신된다.  ★하드웨어가
+--                               실제로 그리는 것은 이쪽이다
+-- 둘은 최대 한 프레임 어긋난다.  VRAM 쪽만 보면, 이미 새 블록을 가리키는데
+-- 내부 사본은 아직 옛 블록을 보는 순간에 "아무도 안 본다"고 잘못 판단한다.
+-- 그러면 화면은 맞는데 스프라이트 뷰어에는 쓰레기가 보인다.
+local SPRITE_RAM = emu.memType.pceSpriteRam    -- 이 빌드에 없을 수도 있다
+
+-- 두 표를 한 프레임에 **한 번만** 훑는다.  대기 블록마다 64 슬롯을 다시 읽으면
+-- 프레임이 눈에 띄게 느려진다 (실측 60 -> 15 FPS).
+-- 2026-08-29 성능 수정.  동작은 그대로고 할당만 없앴다.
+--
+-- 옛 판은 매 프레임 { first, last } 테이블을 128 개 새로 만들고, SPRITE_RAM
+-- 읽기용 클로저도 매 프레임 새로 만들었다.  자막이 떠 있는 동안 drain 이 매
+-- 프레임 도니까 그대로 GC 부담이 됐다 (실측 60 -> 21 FPS).
+--
+-- 재사용 배열 두 개와 미리 만든 함수로 바꿨다.  읽는 값과 판정은 같다.
+local rgFirst, rgLast, rgN = {}, {}, 0
+
+local function readSpriteRam(a) return emu.read(a, SPRITE_RAM) or 0 end
+
+local function scanSpriteTable(readByte, origin)
+  for slot = 0, 63 do
+    local at = origin + slot * 8
+    local pattern = readByte(at + 4) | (readByte(at + 5) << 8)
+    local attr    = readByte(at + 6) | (readByte(at + 7) << 8)
+    local first = (pattern & 0x07FF) << 5
+    local width = ((attr & 0x0100) ~= 0) and 2 or 1
+    local hcode = (attr >> 12) & 0x03
+    local height = (hcode == 0) and 1 or ((hcode == 1) and 2 or 4)
+    rgN = rgN + 1
+    rgFirst[rgN] = first
+    rgLast[rgN] = first + width * height * 0x40 - 1
+  end
+end
+
+local function spriteRanges()
+  rgN = 0
+  scanSpriteTable(rb, 0x2000)                        -- VRAM 의 SATB
+  if SPRITE_RAM then                                 -- VDC 내부 사본
+    scanSpriteTable(readSpriteRam, 0)
+  end
+  return nil                                         -- 결과는 rgFirst/rgLast 에
+end
+
+local function coveredBy(_, base)
+  local last = base + N - 1
+  for i = 1, rgN do
+    if rgLast[i] >= base and rgFirst[i] <= last then return true end
+  end
+  return false
+end
+
+local function defer(base, reason)
+  if not saved[base] or pending[base] then return end
+  pending[base] = { waited = 0, clear = 0, reason = reason }
+end
+
+local function drain()
+  -- 1) 새로 쓴 블록의 지문을 뜬다.  선택 다음 프레임이면 글리프 업로드가 끝나
+  --    있다.  이 시점의 내용이 "우리 것" 의 기준이다.
+  for base in pairs(needPrint) do
+    mine[base] = fingerprint(base)
+    needPrint[base] = nil
+  end
+
+  if next(pending) == nil then return end   -- 대기열이 비면 아무것도 읽지 않는다
+  drainTick = drainTick + 1
+  if drainTick % DRAIN_EVERY ~= 0 then return end
+  local ranges = spriteRanges()
+  for base, info in pairs(pending) do
+    info.waited = info.waited + 1
+    -- 지금 쓰고 있는 블록과 겹치면 상한이 지나도 되돌리지 않는다.  겹친 채로
+    -- 복원하면 현재 자막의 글리프를 지운다.
+    local live = currentBase and base < currentBase + N and currentBase < base + N
+    local held = coveredBy(ranges, base)
+    if live or held then
+      info.clear = 0                        -- 연속 카운트를 처음부터 다시
+    else
+      info.clear = info.clear + 1
+    end
+    -- 두 표가 **연속 GRACE 프레임** 동안 이 블록을 안 가리켜야 되돌린다.
+    -- 한 프레임만 보고 판단하면 DMA 타이밍 사이에 끼어 화면에 얼룩이 스친다.
+    if not live and (info.clear >= GRACE or info.waited >= PENDING_LIMIT) then
+      if mine[base] and fingerprint(base) ~= mine[base] then
+        -- 게임이 이 자리를 가져갔다.  옛 스냅샷을 되돌리면 게임이 방금 그린
+        -- 것을 지운다.  손대지 않고 대기열에서만 뺀다.
+        emu.log(string.format(
+          'DYNAMIC FRAGMENT %s $%04X 은 게임이 가져갔다 -- 복원하지 않는다 (%s · %d프레임 뒤)',
+          VERSION, base, info.reason, info.waited))
+      else
+        restore(base)
+        emu.log(string.format(
+          'DYNAMIC FRAGMENT %s restore $%04X (%s · %d프레임 뒤%s)',
+          VERSION, base, info.reason, info.waited,
+          info.clear < GRACE and ' · 상한 도달, 스프라이트가 아직 잡고 있다' or ''))
+      end
+      saved[base], pending[base], mine[base] = nil, nil, nil
+    end
+  end
+end
+
+local function saneDimension(value, fallback)
+  value = tonumber(value)
+  if value == 32 or value == 64 or value == 128 then return value end
+  return fallback
+end
+
+local function mark(used, first, count)
+  local last = math.min(first + count - 1, 0x7FFF)
+  if first < 0 or first > 0x7FFF then return end
+  for word = first, last do used[word] = true end
+end
+
+local wEntries = 0
+local function referencedWords()
+  local used = {}
+  local ok, state = pcall(emu.getState)
+  if not ok or not state then state = {} end
+
+  -- BAT 은 VRAM word $0000 에서 시작한다.  현재 MWR 로 정해진 실제 크기만
+  -- 읽어야 한다.  무조건 $0000-$0FFF 를 BAT 로 읽으면 그 뒤 패턴 데이터를
+  -- BAT 엔트리로 오해해 안전한 후보를 대량으로 막는다.
+  local columns = saneDimension(state['vdc.hvReg.columnCount'], 64)
+  local rows = saneDimension(state['vdc.hvReg.rowCount'], 64)
+  local entries = math.min(columns * rows, 0x1000)
+  wEntries = entries
+  -- ★ BAT 와 SATB 자신도 쓰이는 자리다.  0.3.35 까지는 이 둘을 표시하지 않아
+  -- $0000-$10FF 4352 word 가 통째로 "비어 있음" 으로 잡혔다.  창이 $6000-$7B00
+  -- 이라 우연히 안 건드렸을 뿐이고, 창을 넓히면 BAT 를 덮어써 화면이 날아간다.
+  mark(used, 0x0000, entries)          -- BAT 본체
+  mark(used, 0x1000, 0x100)            -- SATB 본체 (byte $2000, 64 x 8 B)
+
+  local batPatterns = {}
+  for i = 0, entries - 1 do
+    local pattern = rw(i) & 0x07FF
+    if not batPatterns[pattern] then
+      batPatterns[pattern] = true
+      mark(used, pattern * 0x10, 0x10)       -- BG 8x8 4bpp = 16 words
+    end
+  end
+
+  -- SATB 는 VRAM byte $2000 (word $1000), 64 slots x 8 bytes.
+  -- 크기 비트까지 반영해 시작 패턴만이 아니라 스프라이트 전체 범위를 막는다.
+  local spriteCount = 0
+  for slot = 0, 63 do
+    local at = 0x2000 + slot * 8
+    local y = rb(at) | (rb(at + 1) << 8)
+    local x = rb(at + 2) | (rb(at + 3) << 8)
+    local pattern = rb(at + 4) | (rb(at + 5) << 8)
+    local attr = rb(at + 6) | (rb(at + 7) << 8)
+    if y ~= 0 or x ~= 0 or pattern ~= 0 or attr ~= 0 then
+      local width = ((attr & 0x0100) ~= 0) and 2 or 1
+      local hcode = (attr >> 12) & 0x03
+      local height = (hcode == 0) and 1 or ((hcode == 1) and 2 or 4)
+      local first = (pattern & 0x07FF) << 5
+      mark(used, first, width * height * 0x40)
+      spriteCount = spriteCount + 1
+    end
+  end
+
+  local bgCount = 0
+  for _ in pairs(batPatterns) do bgCount = bgCount + 1 end
+  return used, columns, rows, bgCount, spriteCount
+end
+
+local function freeBlock(base, used)
+  for word = base, base + N - 1 do
+    if used[word] then return false end
+  end
+  return true
+end
+
+-- 실패했을 때 "얼마나 모자란가" 를 재는 부분.  창 확장으로 될 일인지,
+-- 연속성을 깨야만 하는 일인지가 이 숫자로 갈린다.
+local function runStats(used, lo, hi)
+  local best, bestAt, cur, curAt, free = 0, nil, 0, nil, 0
+  for word = lo, hi do
+    if used[word] then
+      cur, curAt = 0, nil
+    else
+      free = free + 1
+      if cur == 0 then curAt = word end
+      cur = cur + 1
+      if cur > best then best, bestAt = cur, curAt end
+    end
+  end
+  return best, bestAt, free
+end
+
+local function reportShortfall(used)
+  local wBest, wAt, wFree = runStats(used, 0x6000, 0x7FFF)
+  local aBest, aAt, aFree = runStats(used, 0x0000, 0x7FFF)
+  emu.log(string.format(
+    'SUB %s SHORTFALL 필요=%d word', VERSION, N))
+  emu.log(string.format(
+    '  창 $6000-$7FFF : 최대연속 %d word @ $%s · 총여유 %d word',
+    wBest, wAt and string.format('%04X', wAt) or '----', wFree))
+  emu.log(string.format(
+    '  VRAM 전체      : 최대연속 %d word @ $%s · 총여유 %d word',
+    aBest, aAt and string.format('%04X', aAt) or '----', aFree))
+  emu.log(string.format('  (BAT %d word + SATB 256 word 는 used 로 제외했다)', wEntries))
+  if aBest >= N then
+    emu.log('  -> 창 밖에 연속 자리가 있다.  창 확장(패턴 상위 비트)이 유효하다')
+  elseif aBest >= 640 then
+    emu.log('  -> 1216 은 안 되지만 절반(10 글자 = 640 word)은 들어간다.')
+    emu.log('     조각을 잘게 쪼개는 쪽이 창 확장보다 싸다')
+  else
+    emu.log('  -> 연속 자리가 거의 없다.  글리프 개별 배치로 연속성을 깨야 한다')
+  end
+end
+
+local function choose()
+  local used, columns, rows, bgCount, spriteCount = referencedWords()
+  -- 0.3.43: 복원 대기 중인 블록과 **겹치는** 자리는 고르지 않는다.
+  -- 후보 간격은 $40 인데 블록은 $4C0 이다.  겹치는 주소를 고르면, 나중에
+  -- drain() 이 그 블록을 옛 스냅샷으로 되돌리면서 지금 자막의 글리프를
+  -- 앞에서부터 지운다 -- 왼쪽 글자만 색깔 쓰레기가 되고 오른쪽만 멀쩡해진다.
+  for base in pairs(pending) do mark(used, base, N) end
+  if FORCE_BASE then
+    -- 우리가 아는 세 바이트(MAWR 하위/상위, 패턴 하위)만 고쳐서 창 밖 주소를
+    -- 써 본다.  패턴 상위 2 비트(base>>13)는 자리를 못 찾아 안 고친다.
+    -- 화면이 정상이면 그 비트는 안 쓰이거나 다른 데서 유도되는 것이고,
+    -- 엉뚱한 데 뜨면 실재하므로 계속 추적해야 한다.
+    local ok = freeBlock(FORCE_BASE, used)
+    emu.log(string.format(
+      'SUB %s FORCE base=$%04X (스캔상 %s) · SATB 예상 $%04X · off281=$%02X',
+      VERSION, FORCE_BASE, ok and '비어있음' or '★사용중★',
+      (FORCE_BASE >> 5) << 5, 0x80 | (((FORCE_BASE >> 13) & 0x07) << 4) | 0x0F))
+    return FORCE_BASE, columns, rows, bgCount, spriteCount
+  end
+  -- 창을 VRAM 전체로 넓혔다.  하위 바이트(+165/+131)와 패턴 상위 비트(+281)를
+  -- 다 패치하므로 $6000-$7FFF 에 갇힐 이유가 없다.
+  --
+  -- ★ 왜 넓히나 (2026-08-28 실측)
+  --   초상화 장면에서 게임이 슬롯 16·18~21 로 $6000~$647F 를 가져갔다.
+  --   우리가 $6000 을 고른 **뒤에** 벌어지는 일이라 고를 때는 알 수 없다.
+  --   같은 8K 를 게임과 다투는 구조 자체를 벗어나야 한다.
+  --   0.3.36 실측: VRAM 전체 최대 연속 3,824 word @ $1110 (창 안은 768 뿐)
+  --
+  -- 순서에 뜻이 있다.  게임이 잘 안 쓰는 앞쪽($1000-$5FFF)을 먼저 보고,
+  -- 없을 때만 원래 창으로 내려온다.  SATB 본체($1000-$10FF)는 used 로 막혀 있다.
+  for base = 0x1100, 0x5FC0, 0x40 do
+    if freeBlock(base, used) then
+      return base, columns, rows, bgCount, spriteCount
+    end
+  end
+  for base = 0x6000, 0x7B00, 0x40 do
+    if freeBlock(base, used) then
+      return base, columns, rows, bgCount, spriteCount
+    end
+  end
+  reportShortfall(used)
+  return nil, columns, rows, bgCount, spriteCount
+end
+
+VERIFY_BASE, VERIFY_AT = nil, 0
+local VERIFY_FRAMES = { [1]=true, [2]=true, [4]=true, [8]=true, [16]=true, [30]=true }
+
+local function vword(word)
+  local at = word * 2
+  return (emu.read(at, VRAM) or 0) | ((emu.read(at + 1, VRAM) or 0) << 8)
+end
+
+local function nonzero(word, n)
+  local c = 0
+  for i = 0, n - 1 do if vword(word + i) ~= 0 then c = c + 1 end end
+  return c
+end
+
+-- SATB 가 실제로 어느 VRAM 주소를 가리키는지.  하드웨어가 보는 진실이다.
+local function satbTargets()
+  local seen, out = {}, {}
+  for slot = 0, 63 do
+    local at = 0x2000 + slot * 8
+    local y = (emu.read(at, VRAM) or 0) | ((emu.read(at+1, VRAM) or 0) << 8)
+    local x = (emu.read(at+2, VRAM) or 0) | ((emu.read(at+3, VRAM) or 0) << 8)
+    local pat = (emu.read(at+4, VRAM) or 0) | ((emu.read(at+5, VRAM) or 0) << 8)
+    if y ~= 0 or x ~= 0 or pat ~= 0 then
+      local addr = (pat & 0x07FF) << 5
+      if not seen[addr] then
+        seen[addr] = true
+        out[#out+1] = string.format('$%04X', addr)
+      end
+    end
+  end
+  return table.concat(out, ' ')
+end
+
+emu.addEventCallback(function()
+  if not VERIFY_BASE then return end
+  VERIFY_AT = VERIFY_AT + 1
+  if not VERIFY_FRAMES[VERIFY_AT] then
+    if VERIFY_AT > 30 then VERIFY_BASE = nil end
+    return
+  end
+  emu.log(string.format(
+    'SUB %s +%02d frame  base $%04X=%d/64  $7900=%d/64  $6100=%d/64',
+    VERSION, VERIFY_AT, VERIFY_BASE, nonzero(VERIFY_BASE, 64),
+    nonzero(0x7900, 64), nonzero(0x6100, 64)))
+  emu.log('    SATB 가 가리키는 주소: ' .. satbTargets())
+  if VERIFY_AT >= 30 then VERIFY_BASE = nil end
+end, emu.eventType.endFrame)
+
+local function patchRenderer(base)
+  -- renderer binary offset 167 = VDC MAWR high, 276 = list pattern low.
+  -- CPU address is zero-based offset from $5B80.
+  emu.write(ENGINE + VRAM_LO_OFFSET, base & 0xFF, MEM)
+  emu.write(ENGINE + VRAM_HI_OFFSET, base >> 8, MEM)
+  emu.write(ENGINE + PAT_LO_OFFSET, (base >> 5) & 0xFF, MEM)
+  -- ★ off 281 = 0x80(앞쪽우선) | 패턴상위<<4 | 팔레트.  $6463 이 AND #$70 으로
+  -- 패턴 상위를, AND #$8F 로 속성을 뽑는다.  이것이 창을 $6000-$7FFF 로 묶던 비트다.
+  emu.write(ENGINE + ATTR_OFFSET, 0x80 | (((base >> 13) & 0x07) << 4) | 0x0F, MEM)
+
+  -- 0.3.38 은 여기서 VRAM 을 읽었는데, count_ok 는 헬퍼가 글리프를 복사하기
+  -- 전이라 항상 0 이 나왔다.  실제 확인은 프레임이 지난 뒤에 한다.
+  if VERIFY_DETAIL then
+    VERIFY_BASE = base
+    VERIFY_AT = 0
+  else
+    VERIFY_BASE = nil
+  end
+  emu.log(string.format('SUB %s PATCHED base=$%04X  렌더러 off165/167/276 = $%02X/$%02X/$%02X',
+    VERSION, base,
+    emu.read(ENGINE + VRAM_LO_OFFSET, MEM) or 0,
+    emu.read(ENGINE + VRAM_HI_OFFSET, MEM) or 0,
+    emu.read(ENGINE + PAT_LO_OFFSET, MEM) or 0))
+end
+
+local function reset(reason)
+  -- 0.3.43: 여기서 바로 되돌리지 않는다.  이 음성이 쓴 블록 전부를 대기열에
+  -- 넣고, SATB 가 놓아준 뒤에 drain() 이 되돌린다.
+  for base in pairs(saved) do defer(base, reason) end
+  active, started, firstBase, currentBase, pendingBase, rebuilds =
+    false, false, nil, nil, nil, 0
+  -- saved 는 비우지 않는다.  drain() 이 실제로 복원한 뒤에 하나씩 지운다.
+end
+
+local function armCurrentVoice(matchedId)
+  local state = emu.getState()
+  local endAddr = ((state['cdrom.adpcm.readAddress'] or 0) +
+                   (state['cdrom.adpcm.adpcmLength'] or 0)) % 0x10000
+  if (state['cdrom.adpcm.playbackRate'] or -1) ~= 0x0E then return end
+  -- 현재 native BIOS POC 자체가 아직 E6800_0E 하나만 시작시킨다.  범용
+  -- selector가 들어가기 전에는 allocator도 같은 범위에서만 돌아야 한다.
+  if TARGET_END ~= false and endAddr ~= TARGET_END then return end
+  reset('new voice')
+  local columns, rows, bgCount, spriteCount
+  pendingBase, columns, rows, bgCount, spriteCount = choose()
+  if not pendingBase then
+    emu.log(string.format('DYNAMIC FRAGMENT %s START SKIP: 참조 없는 블록 없음 · BAT %dx%d/%d패턴 · SATB %d',
+                          VERSION, columns, rows, bgCount, spriteCount))
+    return
+  end
+  prepareFirst(pendingBase)
+  active = true
+  emu.log(string.format('DYNAMIC FRAGMENT %s armed%s: end=$%04X · first $%04X · BAT %dx%d/%d패턴 · SATB %d',
+                        VERSION, matchedId and (' key=' .. matchedId) or '',
+                        endAddr, pendingBase, columns, rows, bgCount, spriteCount))
+end
+
+-- 범용 자막판에서는 0.4.31이 팩 키 일치를 확정한 뒤 이 함수를 부른다.
+-- 전역은 실행 중 callback 연결용이며 Power Cycle 때 함께 사라진다.
+if REQUIRE_MATCHED then
+  _G.SUB_ALLOCATOR_ARM_MATCHED = armCurrentVoice
+end
+
+emu.addMemoryCallback(function()
+  if REQUIRE_MATCHED then return end
+  armCurrentVoice(nil)
+end, emu.callbackType.exec, 0xF61A, 0xF61A, emu.cpuType.pce, CPU)
+
+emu.addMemoryCallback(function()
+  if not active then return end
+  if PATCH_AT_COUNT_OK then return end
+  -- 0.3.43: 전환에서 옛 블록을 복원하지 않는다 (파일 머리말의 잔상 설명 참조).
+  local base, columns, rows, bgCount, spriteCount
+  if pendingBase then
+    base = pendingBase
+    pendingBase = nil
+  else
+    base, columns, rows, bgCount, spriteCount = choose()
+  end
+  if not base then
+    emu.log(string.format('DYNAMIC FRAGMENT %s SKIP #%d: 참조 없는 블록 없음 · BAT %dx%d/%d패턴 · SATB %d',
+                          VERSION, rebuilds + 1, columns, rows, bgCount, spriteCount))
+    return
+  end
+  if not saved[base] then snapshot(base) end
+  pending[base] = nil          -- 0.3.43: 다시 쓰므로 복원 예약을 취소한다
+  mine[base], needPrint[base] = nil, true   -- 다음 프레임에 "우리 것" 지문을 뜬다
+  patchRenderer(base)
+  started = true
+  rebuilds = rebuilds + 1
+  if not firstBase then firstBase = base end
+  currentBase = base
+  emu.log(string.format('DYNAMIC FRAGMENT %s #%d: $%04X selected (BAT+SATB unreferenced)', VERSION, rebuilds, base))
+end, emu.callbackType.exec, REBUILD, REBUILD, emu.cpuType.pce, CPU)
+
+-- 0.3.5 경로: 색인 비교가 성공해 count_ok에 들어온 뒤, glyph upload 전에만
+-- CPU renderer의 VRAM 주소를 바꾼다.  조회 시작점 $5BA6은 완전히 무수정이다.
+if PATCH_AT_COUNT_OK then
+  emu.addMemoryCallback(function()
+    if not active then return end
+    -- 0.3.43: 전환에서 옛 블록을 복원하지 않는다 (파일 머리말의 잔상 설명 참조).
+    local base = pendingBase or choose()
+    pendingBase = nil
+    if not base then
+      emu.log(string.format('DYNAMIC FRAGMENT %s SKIP: count_ok 뒤 안전 블록 없음', VERSION))
+      return
+    end
+    if not saved[base] then snapshot(base) end
+    pending[base] = nil        -- 0.3.43: 다시 쓰므로 복원 예약을 취소한다
+    mine[base], needPrint[base] = nil, true  -- 다음 프레임에 "우리 것" 지문을 뜬다
+    patchRenderer(base)
+    started = true
+    rebuilds = rebuilds + 1
+    if not firstBase then firstBase = base end
+    currentBase = base
+    emu.log(string.format('DYNAMIC FRAGMENT %s #%d: $%04X selected at count_ok',
+                          VERSION, rebuilds, base))
+  end, emu.callbackType.exec, ENGINE + COUNT_OK_OFFSET,
+       ENGINE + COUNT_OK_OFFSET, emu.cpuType.pce, CPU)
+end
+
+emu.addEventCallback(function()
+  if active and started and (emu.read(STATE, MEM) or 0) == 0 then reset('voice end') end
+end, emu.eventType.startFrame)
+
+-- 0.3.43: 대기열은 음성이 끝난 뒤에도 돌아야 하므로 active 와 무관하게 매 프레임.
+emu.addEventCallback(drain, emu.eventType.startFrame)
+
+emu.log('POC_SUBTITLE_DYNAMIC_FRAGMENT_ALLOCATOR ' .. VERSION .. ' -- BAT+SATB referenced-free')
+emu.log(string.format(
+  '  복원 지연: 스프라이트 표 %s · 연속 %d프레임 비어야 되돌림 · 상한 %d프레임',
+  SPRITE_RAM and 'VRAM SATB + VDC 내부 사본 둘 다' or
+                 'VRAM SATB 만 (이 빌드에 pceSpriteRam 이 없다)',
+  GRACE, PENDING_LIMIT))
+emu.log('  음성마다 · 조각마다 현재 참조되지 않는 19글자 블록을 고른다')
+if INPLACE_IMAGES then
+  emu.log('  AC 헬퍼/렌더러 전체 교체 0 B · VRAM 주소 피연산자 4 B만 수정')
+else
+  emu.log('  후보 간격 $100 유지 · 디스크 빌드에는 아직 미반영')
+end
+
+-- ---------------------------------------------------------------- 침범 감시
+-- 0.3.5-allvoice-guard 와 같은 감시.  창을 넓힌 뒤에도 게임이 우리 자리를
+-- 가져가는지 본다.  **여기서 침범 0 이 나오면 창 확장이 답이다.**
+--
+-- 콜백은 이미 다 등록됐지만 emu.log 는 앞으로 나올 것부터 가로채면 되므로
+-- 파일 끝에서 감싸도 늦지 않다.
+do
+  local OUT = 'C:/snatcher/snatcher_tool/logs/allocator_skip_log.tsv'
+  local BLOCK = 19 * 0x40
+  local armedN, fragN, skipN, intrudeN = 0, 0, 0, 0
+  local curBase, reported = nil, {}
+
+  local f = io.open(OUT, 'a')
+  if f and f:seek('end') == 0 then f:write('time\tkind\tline\n') end
+
+  local realLog = emu.log
+  local function put(kind, msg)
+    realLog(msg)
+    if f then
+      f:write(string.format('%s\t%s\t%s\n', os.date('%H:%M:%S'), kind, msg))
+      f:flush()
+    end
+  end
+
+  emu.log = function(msg)
+    local kind = 'info'
+    if msg:find('SKIP') then kind, skipN = 'skip', skipN + 1
+    elseif msg:find('armed') then kind, armedN = 'armed', armedN + 1
+    elseif msg:find('selected') or msg:find('FORCE base') then
+      kind, fragN = 'frag', fragN + 1
+      local hex = msg:match('%$(%x%x%x%x)')
+      if hex then curBase, reported = tonumber(hex, 16), {} end
+    end
+    put(kind, msg)
+  end
+
+  local VR = emu.memType.pceVideoRam
+  local function rb(at) return emu.read(at, VR) or 0 end
+
+  emu.addEventCallback(function()
+    emu.drawString(4, 4, string.format('음성 %d  조각 %d', armedN, fragN),
+                   0xFFFFFF, 0x000000)
+    if skipN > 0 then
+      emu.drawString(4, 14, string.format('SKIP %d', skipN), 0xFF4040, 0x000000)
+    end
+    if intrudeN > 0 then
+      emu.drawString(4, 24, string.format('침범 %d', intrudeN), 0xFFA000, 0x000000)
+    end
+    if not curBase then return end
+    watchTick = watchTick + 1
+    if watchTick % WATCH_EVERY ~= 0 then return end
+    for slot = 0, 63 do
+      local at = 0x2000 + slot * 8
+      local pattern = rb(at + 4) | (rb(at + 5) << 8)
+      local attr = rb(at + 6) | (rb(at + 7) << 8)
+      if (attr & 0x0F) ~= 0x0F then          -- 팔레트 F 는 우리 자막
+        local first = (pattern & 0x07FF) << 5
+        local width = ((attr & 0x0100) ~= 0) and 2 or 1
+        local hcode = (attr >> 12) & 0x03
+        local height = (hcode == 0) and 1 or ((hcode == 1) and 2 or 4)
+        local last = first + width * height * 0x40 - 1
+        if last >= curBase and first < curBase + BLOCK and not reported[slot] then
+          reported[slot] = true
+          intrudeN = intrudeN + 1
+          put('intrude', string.format(
+              'INTRUDER 슬롯 %d 패턴 $%04X~$%04X 팔레트 %X · 우리 $%04X~$%04X',
+              slot, first, last, attr & 0x0F, curBase, curBase + BLOCK - 1))
+        end
+      end
+    end
+  end, emu.eventType.startFrame)
+
+  realLog('SUB 0.3.42-wide -- 창을 VRAM 전체로.  침범이 0 이 되는지 본다')
+end
